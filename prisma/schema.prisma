@@ -1,0 +1,423 @@
+// Notification system data model.
+//
+// Reading order:
+//   1. User / PushDevice        - who we can reach, and how
+//   2. Topic / Template         - what kinds of notifications exist, and how they render
+//   3. Preference               - what each user actually wants
+//   4. Notification / Delivery  - the intent, and one attempt record per channel
+//   5. OutboxEvent / WebhookEvent - the reliability seams (DB->queue, provider->us)
+//   6. Suppression / DigestBucket / ApiKey - compliance, batching, auth
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Channel {
+  EMAIL
+  IN_APP
+  PUSH
+  SLACK
+  SMS
+}
+
+enum TopicCategory {
+  /// Tied to an action the user took (receipts, password resets). Ignores marketing opt-outs
+  /// and quiet hours: withholding these breaks the product.
+  TRANSACTIONAL
+  /// Promotional. Must honour unsubscribe, quiet hours and digest preferences.
+  MARKETING
+}
+
+enum Priority {
+  LOW
+  NORMAL
+  HIGH
+  /// Bypasses quiet-hours deferral (e.g. security alerts).
+  CRITICAL
+}
+
+enum DigestMode {
+  IMMEDIATE
+  HOURLY
+  DAILY
+}
+
+enum NotificationStatus {
+  /// Row committed, outbox not yet relayed.
+  PENDING
+  /// Dispatch worker fanned it out into Delivery rows.
+  DISPATCHED
+  /// Some channels succeeded, some failed.
+  PARTIAL
+  /// Every delivery reached a successful terminal state.
+  COMPLETED
+  /// Every delivery failed or was suppressed.
+  FAILED
+}
+
+enum DeliveryStatus {
+  QUEUED
+  RENDERED
+  SENT
+  DELIVERED
+  OPENED
+  CLICKED
+  /// No address for this channel (e.g. user has no phone number).
+  SKIPPED
+  /// Deliberately not sent: preference off, unsubscribed, duplicate, or on the suppression list.
+  SUPPRESSED
+  /// Retries exhausted.
+  FAILED
+  /// Hard bounce reported by the provider.
+  BOUNCED
+  /// Recipient marked it as spam.
+  COMPLAINED
+}
+
+enum SuppressionReason {
+  HARD_BOUNCE
+  SPAM_COMPLAINT
+  UNSUBSCRIBED
+  MANUAL
+}
+
+// ---------------------------------------------------------------------------
+// 1. Recipients
+// ---------------------------------------------------------------------------
+
+model User {
+  id             String  @id @default(cuid())
+  email          String? @unique
+  phone          String?
+  slackChannelId String?
+
+  /// IANA zone, e.g. "Asia/Dhaka". Quiet hours are evaluated in the user's own local time.
+  timezone String @default("UTC")
+  locale   String @default("en")
+
+  /// Local hour (0-23) the quiet window opens/closes. Null on either side disables it.
+  /// The window may wrap midnight (e.g. 22 -> 7).
+  quietHoursStart Int?
+  quietHoursEnd   Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  devices       PushDevice[]
+  preferences   Preference[]
+  notifications Notification[]
+  digestBuckets DigestBucket[]
+
+  @@map("users")
+}
+
+model PushDevice {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Browser push endpoint URL. Unique because re-subscribing yields the same endpoint.
+  endpoint String @unique
+  /// Web Push encryption keys from PushSubscription.getKey().
+  p256dh   String
+  auth     String
+
+  userAgent String?
+  lastSeenAt DateTime @default(now())
+  /// Set when the push service returns 404/410 — the subscription is permanently gone.
+  disabledAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, disabledAt])
+  @@map("push_devices")
+}
+
+// ---------------------------------------------------------------------------
+// 2. Topics & templates
+// ---------------------------------------------------------------------------
+
+model Topic {
+  /// Dotted event name, e.g. "order.shipped". This is the public contract producers code against.
+  key      String        @id
+  name     String
+  category TopicCategory
+  priority Priority      @default(NORMAL)
+
+  /// Channels used when a user has expressed no preference.
+  defaultChannels Channel[]
+
+  /// JSON Schema for the `data` payload. Validated on ingest so a broken producer fails at the
+  /// API boundary instead of inside a worker where nobody is watching.
+  payloadSchema Json
+
+  /// Collapse identical notifications inside this window. 0 disables dedup.
+  dedupWindowSec Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  templates     Template[]
+  notifications Notification[]
+  preferences   Preference[]
+
+  @@map("topics")
+}
+
+model Template {
+  id       String  @id @default(cuid())
+  topicKey String
+  topic    Topic   @relation(fields: [topicKey], references: [key], onDelete: Cascade)
+  channel  Channel
+  locale   String  @default("en")
+  /// Templates are versioned, never edited in place: a Delivery records what it actually rendered.
+  version  Int     @default(1)
+
+  /// Handlebars. Unused by channels without a subject line.
+  subject String?
+  /// Handlebars. MJML markup for EMAIL, plain text elsewhere.
+  body    String
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+
+  @@unique([topicKey, channel, locale, version])
+  @@index([topicKey, channel, locale, isActive])
+  @@map("templates")
+}
+
+// ---------------------------------------------------------------------------
+// 3. Preferences
+// ---------------------------------------------------------------------------
+
+model Preference {
+  id       String  @id @default(cuid())
+  userId   String
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  topicKey String
+  topic    Topic   @relation(fields: [topicKey], references: [key], onDelete: Cascade)
+  channel  Channel
+
+  /// Tri-state: true = force on, false = force off, null = inherit Topic.defaultChannels.
+  /// A nullable boolean is the whole point — "unset" and "off" must be distinguishable, otherwise
+  /// changing a topic default silently overrides choices users already made.
+  enabled Boolean?
+
+  digest DigestMode @default(IMMEDIATE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, topicKey, channel])
+  @@index([userId])
+  @@map("preferences")
+}
+
+// ---------------------------------------------------------------------------
+// 4. Notifications & deliveries
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id       String @id @default(cuid())
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  topicKey String
+  topic    Topic  @relation(fields: [topicKey], references: [key])
+
+  /// Template variables supplied by the producer.
+  data Json
+
+  /// Caller-supplied replay guard. The unique index is what actually enforces
+  /// at-most-once ingest under concurrent retries.
+  idempotencyKey String? @unique
+  /// Cached response body, returned verbatim on an idempotent replay.
+  responseSnapshot Json?
+
+  /// topicKey + userId + hash(data), used for the dedup window.
+  dedupKey String?
+
+  status        NotificationStatus @default(PENDING)
+  correlationId String
+
+  /// Future-dated sends. Honoured as a BullMQ job delay.
+  scheduledAt DateTime?
+  /// Channels explicitly requested by the caller, overriding topic defaults (still filtered
+  /// by user preferences).
+  requestedChannels Channel[]
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  dispatchedAt DateTime?
+
+  deliveries Delivery[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([dedupKey, createdAt])
+  @@index([status])
+  @@map("notifications")
+}
+
+model Delivery {
+  id             String       @id @default(cuid())
+  notificationId String
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  channel        Channel
+
+  /// Which adapter handled it ("resend", "smtp", "web-push", ...). Recorded because a failover
+  /// means the provider is not knowable from the channel alone.
+  provider          String?
+  /// Provider-side id. Unique so inbound webhooks can map back to exactly one delivery.
+  providerMessageId String? @unique
+
+  status   DeliveryStatus @default(QUEUED)
+  attempts Int            @default(0)
+  lastError String?
+  /// Why a SKIPPED/SUPPRESSED delivery was not sent, for the audit trail.
+  reason   String?
+
+  /// What was actually rendered. The in-app inbox reads these directly.
+  renderedSubject String?
+  renderedBody    String?
+  templateVersion Int?
+
+  /// IN_APP only.
+  readAt DateTime?
+
+  queuedAt    DateTime  @default(now())
+  sentAt      DateTime?
+  deliveredAt DateTime?
+  failedAt    DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  events DeliveryEvent[]
+
+  @@index([notificationId])
+  @@index([channel, status])
+  // Powers the in-app inbox query: unread first, newest first.
+  @@index([channel, readAt, queuedAt(sort: Desc)])
+  @@map("deliveries")
+}
+
+/// Append-only audit log. Never updated, so it is safe to read for "what happened to this email".
+model DeliveryEvent {
+  id         String   @id @default(cuid())
+  deliveryId String
+  delivery   Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+
+  /// "queued", "sent", "email.delivered", "email.bounced", "retry", ...
+  type    String
+  payload Json?
+
+  /// Provider-reported time, which can differ from when we processed it.
+  occurredAt DateTime @default(now())
+
+  @@index([deliveryId, occurredAt])
+  @@index([occurredAt])
+  @@map("delivery_events")
+}
+
+// ---------------------------------------------------------------------------
+// 5. Reliability seams
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Written in the SAME transaction as the Notification, then relayed to
+/// the queue by a poller. Without this, a crash between COMMIT and queue.add() loses the job
+/// silently — the notification exists in the DB but nothing will ever send it.
+model OutboxEvent {
+  id      String @id @default(cuid())
+  type    String
+  payload Json
+
+  processedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?
+  /// Lets the relay ignore a row until a retry backoff has elapsed.
+  availableAt DateTime  @default(now())
+
+  createdAt DateTime @default(now())
+
+  @@index([processedAt, availableAt])
+  @@map("outbox_events")
+}
+
+/// Inbound provider callbacks, keyed by the provider's own message id (svix-id for Resend).
+/// The primary key IS the dedup mechanism: providers retry webhooks aggressively, and
+/// double-processing an `email.opened` would corrupt engagement counts.
+model WebhookEvent {
+  id       String @id
+  provider String
+  type     String
+  payload  Json
+
+  processedAt DateTime?
+  error       String?
+  receivedAt  DateTime @default(now())
+
+  @@index([provider, receivedAt])
+  @@map("webhook_events")
+}
+
+// ---------------------------------------------------------------------------
+// 6. Compliance, batching, auth
+// ---------------------------------------------------------------------------
+
+/// Addresses we must stop contacting. Fed by hard bounces and spam complaints; checked before
+/// every send. Ignoring this is the fastest way to destroy a sending domain's reputation.
+model Suppression {
+  id      String            @id @default(cuid())
+  channel Channel
+  address String
+  reason  SuppressionReason
+  detail  String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([channel, address])
+  @@map("suppressions")
+}
+
+/// Accumulator for HOURLY/DAILY digests. Items pile up here instead of sending individually,
+/// then a repeatable job flushes each open bucket into a single summary notification.
+model DigestBucket {
+  id      String     @id @default(cuid())
+  userId  String
+  user    User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel Channel
+  window  DigestMode
+
+  /// Array of { topicKey, subject, body, at } entries.
+  items Json @default("[]")
+
+  flushedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  // At most one open bucket per (user, channel, window). Partial-unique on flushedAt IS NULL
+  // is not expressible in Prisma, so the flush job closes a bucket before opening the next.
+  @@index([userId, channel, window, flushedAt])
+  @@index([flushedAt, window])
+  @@map("digest_buckets")
+}
+
+model ApiKey {
+  id   String @id @default(cuid())
+  name String
+  /// SHA-256 of the key. The plaintext is shown once at creation and never stored.
+  hashedKey String @unique
+  scopes    String[] @default(["notifications:write"])
+  revokedAt DateTime?
+  lastUsedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@map("api_keys")
+}

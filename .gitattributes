@@ -1,0 +1,10 @@
+# Normalise line endings in the repository to LF regardless of the checkout platform.
+# Without this, a Windows checkout commits CRLF and every file shows as fully changed when
+# someone on Linux or macOS touches it.
+* text=auto eol=lf
+
+# Binary / generated files git should not try to diff or normalise.
+*.png binary
+*.jpg binary
+*.ico binary
+package-lock.json -diff linguist-generated

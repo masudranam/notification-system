@@ -1,0 +1,49 @@
+# Postgres is intentionally NOT here.
+#
+# This machine already runs a local PostgreSQL 18 service on 5432 (alongside the other project
+# databases), and publishing a container on the same host port makes which server you reach
+# ambiguous. So DATABASE_URL points at the local instance and compose only provides the pieces
+# that aren't already installed.
+#
+# To run Postgres in Docker instead, add a service here on host port 5433 and update
+# DATABASE_URL to match — do not reuse 5432.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: notif-redis
+    restart: unless-stopped
+    # BullMQ requires no key eviction: a full instance must error, never silently drop jobs.
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    ports:
+      - '6379:6379'
+    volumes:
+      - notif-redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Optional: browse queue keys at http://localhost:8081
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: notif-redis-commander
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - '8081:8081'
+    depends_on:
+      - redis
+
+  # Optional: catch-all SMTP inbox at http://localhost:8025 (used by the SMTP fallback provider)
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: notif-mailhog
+    restart: unless-stopped
+    ports:
+      - '1025:1025'
+      - '8025:8025'
+
+volumes:
+  notif-redisdata:

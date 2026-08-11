@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Notification System — demo</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <h1>Notification System</h1>
+      </div>
+      <div class="topbar-right">
+        <label class="field inline">
+          <span>Recipient</span>
+          <select id="user-select"></select>
+        </label>
+        <span id="sse-status" class="badge badge-muted" title="Server-Sent Events connection">
+          stream: connecting…
+        </span>
+        <a class="link" href="/docs" target="_blank" rel="noopener">API docs</a>
+      </div>
+    </header>
+
+    <main class="grid">
+      <!-- ---------------------------------------------------------------- trigger -->
+      <section class="card">
+        <h2>1 · Trigger a notification</h2>
+        <p class="hint">
+          Posts to <code>/v1/notifications</code>. The API returns <code>202</code> immediately —
+          everything after that happens in background workers.
+        </p>
+
+        <label class="field">
+          <span>Topic</span>
+          <select id="topic-select"></select>
+        </label>
+
+        <p id="topic-meta" class="topic-meta"></p>
+
+        <label class="field">
+          <span>Payload <em>(validated against the topic's JSON Schema)</em></span>
+          <textarea id="payload" rows="8" spellcheck="false"></textarea>
+        </label>
+
+        <label class="field">
+          <span>
+            Idempotency-Key
+            <em>(send the same key twice — the second call is a replay, not a new send)</em>
+          </span>
+          <div class="row">
+            <input id="idempotency-key" type="text" placeholder="optional" />
+            <button id="new-key" class="btn btn-ghost" type="button" title="Generate a new key">
+              ↻
+            </button>
+          </div>
+        </label>
+
+        <div class="row">
+          <button id="send" class="btn btn-primary" type="button">Send notification</button>
+          <button id="send-dup" class="btn" type="button" title="Re-post with the same key">
+            Re-send same key
+          </button>
+        </div>
+
+        <pre id="send-result" class="result" hidden></pre>
+      </section>
+
+      <!-- ---------------------------------------------------------------- inbox -->
+      <section class="card">
+        <h2>
+          2 · In-app inbox
+          <span id="unread-badge" class="badge badge-accent" hidden>0</span>
+        </h2>
+        <p class="hint">
+          Backed by <code>IN_APP</code> delivery rows. New items arrive over SSE without polling.
+        </p>
+        <div class="row">
+          <button id="mark-all-read" class="btn btn-ghost" type="button">Mark all read</button>
+          <button id="refresh-inbox" class="btn btn-ghost" type="button">Refresh</button>
+        </div>
+        <ul id="inbox" class="inbox"></ul>
+      </section>
+
+      <!-- ---------------------------------------------------------------- deliveries -->
+      <section class="card wide">
+        <h2>3 · Delivery trace</h2>
+        <p class="hint">
+          One row per channel per notification. <strong>SKIPPED</strong> means there was nowhere to
+          send (no phone number, no push subscription); <strong>SUPPRESSED</strong> means we chose
+          not to (preference, unsubscribe, bounce list, digest).
+        </p>
+        <div id="deliveries" class="deliveries"></div>
+      </section>
+
+      <!-- ---------------------------------------------------------------- preferences -->
+      <section class="card">
+        <h2>4 · Preferences</h2>
+        <p class="hint">
+          Tri-state per topic × channel: <em>on</em>, <em>off</em>, or <em>inherit</em> the topic
+          default. Transactional topics ignore marketing opt-outs.
+        </p>
+        <div id="preferences" class="prefs"></div>
+      </section>
+
+      <!-- ---------------------------------------------------------------- push + ops -->
+      <section class="card">
+        <h2>5 · Web Push &amp; operations</h2>
+        <p class="hint">
+          Push uses your own VAPID keypair — no vendor account. Run
+          <code>npm run keys:vapid</code> if it reports unconfigured.
+        </p>
+        <div class="row">
+          <button id="push-subscribe" class="btn btn-primary" type="button">
+            Enable browser notifications
+          </button>
+          <button id="push-unsubscribe" class="btn btn-ghost" type="button">Disable</button>
+        </div>
+        <p id="push-status" class="hint"></p>
+
+        <h3>Circuit breakers</h3>
+        <div id="breakers" class="breakers"></div>
+
+        <h3>Dead-letter queue</h3>
+        <div id="dlq" class="dlq"></div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
