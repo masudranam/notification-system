@@ -1,5 +1,5 @@
-import { Controller, Get } from '@nestjs/common';
-import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Controller, Get, Redirect } from '@nestjs/common';
+import { ApiExcludeEndpoint, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { HealthCheck, HealthCheckService } from '@nestjs/terminus';
 import { Public } from 'src/common/auth/public.decorator';
 import { PrismaHealthIndicator } from './prisma.health';
@@ -15,6 +15,15 @@ export class HealthController {
     private readonly redis: RedisHealthIndicator,
     private readonly providers: ProvidersHealthIndicator,
   ) {}
+
+  /** Hitting the bare host should land somewhere useful rather than a 404. */
+  @Public()
+  @Get()
+  @Redirect('/demo', 302)
+  @ApiExcludeEndpoint()
+  root() {
+    return;
+  }
 
   /**
    * Liveness + readiness in one endpoint.
