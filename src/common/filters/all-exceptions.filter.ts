@@ -36,18 +36,18 @@ export class AllExceptionsFilter implements ExceptionFilter {
       timestamp: new Date().toISOString(),
     };
 
-    const logMeta = { path: req.url, method: req.method, statusCode: status };
+    // Nest's LoggerService takes `context` as a trailing *string*, not an options object —
+    // passing `{ context: '...' }` logs the literal `[object Object]` as the context. The
+    // message already carries method, path and status, so there is no separate meta to attach.
+    const line = `${req.method} ${req.url} -> ${status}: ${message}`;
     if (status >= HttpStatus.INTERNAL_SERVER_ERROR) {
       this.logger.error(
-        `${req.method} ${req.url} -> ${status}: ${message}`,
+        line,
         exception instanceof Error ? exception.stack : undefined,
         'ExceptionFilter',
       );
     } else {
-      this.logger.warn(`${req.method} ${req.url} -> ${status}: ${message}`, {
-        ...logMeta,
-        context: 'ExceptionFilter',
-      });
+      this.logger.warn(line, 'ExceptionFilter');
     }
 
     res.status(status).json(payload);

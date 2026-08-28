@@ -13,6 +13,9 @@ import {
   OUTBOX_MAX_ATTEMPTS,
 } from './outbox.constants';
 
+/** Keep the claim transaction short: it holds locks that block every other relay instance. */
+const CLAIM_TX_OPTIONS = { timeout: 10_000, maxWait: 5_000 } as const;
+
 /**
  * Relays committed outbox rows onto the dispatch queue.
  *
@@ -68,6 +71,12 @@ export class OutboxRelay implements OnApplicationBootstrap, OnModuleDestroy {
   private async relayBatch(): Promise<number> {
     // Claim rows and mark them in one transaction so a crash mid-tick releases the locks and
     // another instance retries them.
+    //
+    // Explicit timeouts rather than Prisma's 5s default: this transaction holds row locks that
+    // block every other relay instance, so it must fail fast rather than linger. `maxWait` caps
+    // how long we queue for a connection when the pool is busy. Observed in practice after the
+    // host slept mid-tick — the transaction was 245s old on resume and the commit was rejected,
+    // which the outer catch handles by simply retrying the batch.
     const claimed = await this.prisma.$transaction(async (tx) => {
       // `NOW() AT TIME ZONE 'UTC'`, not plain `NOW()`.
       //
@@ -97,7 +106,7 @@ export class OutboxRelay implements OnApplicationBootstrap, OnModuleDestroy {
         data: { attempts: { increment: 1 } },
       });
       return rows;
-    });
+    }, CLAIM_TX_OPTIONS);
 
     if (claimed.length === 0) return 0;
 
